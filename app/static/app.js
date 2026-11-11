@@ -1,375 +1,279 @@
-/* 防火墙规则变更核对工具前端逻辑（原生 JS，无构建步骤）。 */
-
-const MAX_RULES = 20;
+/* 设备授权演示页：左侧模拟无浏览器终端，右侧人工审批控制台。 */
 
 const state = {
-  old_rules: [],
-  new_rules: [],
+  deviceCode: null,
+  userCode: null,
+  clientId: null,
+  accessToken: null,
+  autoTimer: null,
+  currentApproval: null,
+  approver: null,
 };
 
-const emptyRule = () => ({
-  src_cidr: "",
-  dst_cidr: "",
-  port_low: 0,
-  port_high: 65535,
-  action: "deny",
+const $ = (id) => document.getElementById(id);
+
+async function api(url, body) {
+  const opts = { method: "GET", headers: { "Content-Type": "application/json" } };
+  if (body !== undefined) {
+    opts.method = "POST";
+    opts.body = JSON.stringify(body);
+  }
+  const resp = await fetch(url, opts);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const err = new Error(data.message || data.error || `HTTP ${resp.status}`);
+    err.code = data.error;
+    err.status = resp.status;
+    throw err;
+  }
+  return data;
+}
+
+function fmtTime(ts) {
+  return new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false });
+}
+
+function log(target, message, payload) {
+  const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  let line = `[${time}] ${message}`;
+  if (payload !== undefined) line += "\n" + JSON.stringify(payload, null, 2);
+  target.textContent += line + "\n";
+  target.scrollTop = target.scrollHeight;
+}
+
+const termLog = () => $("terminalLog");
+const adminLog = () => $("adminLog");
+
+// ---------------------------------------------------------------------------
+// 演示身份切换
+// ---------------------------------------------------------------------------
+
+async function loadIdentities() {
+  const data = await api("/api/admin/identities");
+  const sel = $("identitySelect");
+  sel.innerHTML = "";
+  for (const name of data.identities) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    sel.appendChild(opt);
+  }
+  state.approver = sel.value;
+  sel.addEventListener("change", () => {
+    state.approver = sel.value;
+    log(adminLog(), `已切换本地演示身份：${sel.value}`);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 终端侧
+// ---------------------------------------------------------------------------
+
+$("btnAuthorize").addEventListener("click", async () => {
+  const clientId = $("clientId").value.trim();
+  const deviceName = $("deviceName").value.trim();
+  if (!clientId || !deviceName) return alert("请填写客户端 ID 与设备名");
+  try {
+    const data = await api("/api/device/authorize", { client_id: clientId, device_name: deviceName });
+    state.deviceCode = data.device_code;
+    state.userCode = data.user_code;
+    state.clientId = clientId;
+    state.accessToken = null;
+    $("authResult").hidden = false;
+    $("outDeviceCode").textContent = data.device_code;
+    $("outUserCode").textContent = data.user_code;
+    $("outExpiresAt").textContent = `${fmtTime(data.expires_at)}（${data.expires_in} 秒）`;
+    $("btnClaim").disabled = true;
+    $("btnCallIdentity").disabled = true;
+    $("inputUserCode").value = data.user_code;
+    log(termLog(), "POST /api/device/authorize → 取得设备码与人工短码", data);
+    refreshRecords();
+  } catch (e) {
+    log(termLog(), `发起失败：${e.message}`);
+  }
 });
 
-// --------------------------------------------------------------------------- //
-// 规则表渲染
-// --------------------------------------------------------------------------- //
-function renderTable(key) {
-  const tbody = document.getElementById(`tbody-${key}`);
-  tbody.innerHTML = "";
+$("btnPoll").addEventListener("click", () => pollOnce());
 
-  if (state[key].length === 0) {
-    const tr = document.createElement("tr");
-    tr.className = "empty-row";
-    tr.innerHTML = '<td colspan="7">暂无规则，点击右上角“添加规则”或载入示例</td>';
-    tbody.appendChild(tr);
-    return;
-  }
-
-  state[key].forEach((rule, idx) => {
-    const tr = document.createElement("tr");
-
-    tr.appendChild(textTd(String(idx + 1)));
-    tr.appendChild(inputTd(key, rule, idx, "src_cidr", "text", "10.0.0.0/8"));
-    tr.appendChild(inputTd(key, rule, idx, "dst_cidr", "text", "192.168.0.0/16"));
-    tr.appendChild(inputTd(key, rule, idx, "port_low", "number", "0-65535"));
-    tr.appendChild(inputTd(key, rule, idx, "port_high", "number", "0-65535"));
-    tr.appendChild(actionTd(key, rule, idx));
-
-    const opsTd = document.createElement("td");
-    const up = smallButton("↑", () => moveRule(key, idx, -1), idx === 0);
-    const down = smallButton("↓", () => moveRule(key, idx, 1), idx === state[key].length - 1);
-    const del = smallButton("删除", () => removeRule(key, idx), false);
-    opsTd.append(up, down, del);
-    tr.appendChild(opsTd);
-
-    tbody.appendChild(tr);
-  });
-}
-
-function textTd(text) {
-  const cell = document.createElement("td");
-  cell.textContent = text;
-  return cell;
-}
-
-function inputTd(key, rule, idx, field, type, placeholder) {
-  const cell = document.createElement("td");
-  const input = document.createElement("input");
-  input.type = type;
-  input.placeholder = placeholder || "";
-  input.value = rule[field];
-  if (type === "number") {
-    input.min = 0;
-    input.max = 65535;
-  }
-  input.addEventListener("input", () => {
-    state[key][idx][field] = type === "number" ? normalizePort(input.value) : input.value.trim();
-  });
-  cell.appendChild(input);
-  return cell;
-}
-
-function actionTd(key, rule, idx) {
-  const cell = document.createElement("td");
-  const select = document.createElement("select");
-  for (const value of ["allow", "deny"]) {
-    const opt = document.createElement("option");
-    opt.value = value;
-    opt.textContent = value === "allow" ? "允许 allow" : "拒绝 deny";
-    select.appendChild(opt);
-  }
-  select.value = rule.action;
-  select.addEventListener("change", () => {
-    state[key][idx].action = select.value;
-  });
-  cell.appendChild(select);
-  return cell;
-}
-
-function normalizePort(value) {
-  if (value === "") return "";
-  const n = Number(value);
-  return Number.isFinite(n) ? Math.trunc(n) : value;
-}
-
-function smallButton(text, onClick, disabled) {
-  const btn = document.createElement("button");
-  btn.type = "button";
-  btn.className = "btn btn-small btn-move";
-  btn.textContent = text;
-  btn.disabled = !!disabled;
-  btn.addEventListener("click", onClick);
-  return btn;
-}
-
-function addRule(key) {
-  if (state[key].length >= MAX_RULES) {
-    showError(`每份规则表最多 ${MAX_RULES} 条规则`);
-    return;
-  }
-  state[key].push(emptyRule());
-  renderAll();
-}
-
-function removeRule(key, idx) {
-  state[key].splice(idx, 1);
-  renderAll();
-}
-
-function moveRule(key, idx, delta) {
-  const target = idx + delta;
-  if (target < 0 || target >= state[key].length) return;
-  const list = state[key];
-  [list[idx], list[target]] = [list[target], list[idx]];
-  renderAll();
-}
-
-function renderAll() {
-  renderTable("old_rules");
-  renderTable("new_rules");
-}
-
-// --------------------------------------------------------------------------- //
-// 结果渲染
-// --------------------------------------------------------------------------- //
-function fmtCount(n) {
-  return n.toLocaleString("en-US");
-}
-
-function renderResults(data) {
-  const results = document.getElementById("results");
-  results.hidden = false;
-
-  const s = data.stats;
-  document.getElementById("results-summary").innerHTML = `
-    <span class="stat">空间切分：<b>${fmtCount(s.grid_cells)}</b> 个基本单元
-      （源段 ${s.src_segments} × 目标段 ${s.dst_segments} × 端口段 ${s.port_segments}）</span>
-    <span class="stat">新增放行区域：<b style="color:var(--allow)">${s.allowed_region_count}</b> 个，
-      覆盖连接 <b>${fmtCount(s.allowed_connection_count)}</b> 条</span>
-    <span class="stat">新增阻断区域：<b style="color:var(--block)">${s.blocked_region_count}</b> 个，
-      覆盖连接 <b>${fmtCount(s.blocked_connection_count)}</b> 条</span>`;
-
-  renderRegionList("allowed-regions", data.newly_allowed, "allow");
-  renderRegionList("blocked-regions", data.newly_blocked, "block");
-  results.scrollIntoView({ behavior: "smooth", block: "start" });
-}
-
-function renderRegionList(elementId, regions, kind) {
-  const el = document.getElementById(elementId);
-  el.innerHTML = "";
-  if (regions.length === 0) {
-    const div = document.createElement("div");
-    div.className = "no-change";
-    div.textContent = kind === "allow" ? "无新增放行连接。" : "无新增阻断连接。";
-    el.appendChild(div);
-    return;
-  }
-  regions.forEach((region) => el.appendChild(regionCard(region, kind)));
-}
-
-function regionCard(region, kind) {
-  const card = document.createElement("div");
-  card.className = `region-card ${kind}`;
-
-  const head = document.createElement("div");
-  head.className = "region-head";
-  head.innerHTML = `
-    <span class="region-id">区域 #${region.id}（${kind === "allow" ? "新增放行" : "新增阻断"}）</span>
-    <span class="region-meta">该区域共包含 ${fmtCount(region.connection_count)} 条连接
-      （源 IP 数 × 目标 IP 数 × 端口数）</span>`;
-  card.appendChild(head);
-
-  const grid = document.createElement("div");
-  grid.className = "segment-grid";
-  grid.appendChild(segmentBox("源地址段（互不重叠）", region.src_segment, true));
-  grid.appendChild(segmentBox("目标地址段（互不重叠）", region.dst_segment, true));
-  grid.appendChild(segmentBox("TCP 目标端口段（闭区间）", region.port_segment, false));
-  card.appendChild(grid);
-
-  const sample = document.createElement("div");
-  sample.className = "sample-line";
-  sample.innerHTML = `示例连接：<code>${escapeHtml(region.sample_connection.label)}</code>`;
-  card.appendChild(sample);
-
-  const hits = document.createElement("div");
-  hits.className = "hit-grid";
-  hits.appendChild(hitBox("旧规则侧命中", region.old_side));
-  hits.appendChild(hitBox("新规则侧命中", region.new_side));
-  card.appendChild(hits);
-
-  return card;
-}
-
-function segmentBox(label, segment, isIp) {
-  const box = document.createElement("div");
-  box.className = "segment-box";
-  const lab = document.createElement("div");
-  lab.className = "seg-label";
-  lab.textContent = label;
-  box.appendChild(lab);
-
-  const value = document.createElement("div");
-  value.className = "seg-value";
-  value.textContent = segment.label;
-  box.appendChild(value);
-
-  if (isIp && segment.cidrs && segment.cidrs.length > 1) {
-    const ul = document.createElement("ul");
-    ul.className = "cidr-list";
-    segment.cidrs.forEach((cidr) => {
-      const li = document.createElement("li");
-      li.textContent = cidr;
-      ul.appendChild(li);
-    });
-    box.appendChild(ul);
-  }
-  return box;
-}
-
-function hitBox(sideLabel, hit) {
-  const box = document.createElement("div");
-  const cls = hit.kind === "default_deny" ? "default" : hit.rule.action;
-  box.className = `hit-box ${cls}`;
-
-  const side = document.createElement("div");
-  side.className = "hit-side";
-  side.textContent = sideLabel;
-  box.appendChild(side);
-
-  const body = document.createElement("code");
-  body.textContent = hit.label;
-  box.appendChild(body);
-  return box;
-}
-
-function escapeHtml(text) {
-  const div = document.createElement("div");
-  div.textContent = text;
-  return div.innerHTML;
-}
-
-// --------------------------------------------------------------------------- //
-// 交互与 API 调用
-// --------------------------------------------------------------------------- //
-function showError(message) {
-  const banner = document.getElementById("error-banner");
-  banner.textContent = message;
-  banner.hidden = false;
-}
-
-function clearError() {
-  document.getElementById("error-banner").hidden = true;
-}
-
-function validateBeforeSubmit() {
-  for (const key of ["old_rules", "new_rules"]) {
-    if (state[key].length === 0) {
-      return `${key === "old_rules" ? "旧" : "新"}规则表不能为空（允许只写默认拒绝规则）`;
-    }
-    for (let i = 0; i < state[key].length; i += 1) {
-      const r = state[key][i];
-      if (!r.src_cidr || !r.dst_cidr) {
-        return `${key === "old_rules" ? "旧" : "新"}规则表第 ${i + 1} 条：源/目标 CIDR 不能为空`;
-      }
-      if (r.port_low === "" || r.port_high === "") {
-        return `${key === "old_rules" ? "旧" : "新"}规则表第 ${i + 1} 条：端口不能为空`;
-      }
-      if (Number(r.port_low) > Number(r.port_high)) {
-        return `${key === "old_rules" ? "旧" : "新"}规则表第 ${i + 1} 条：端口下限不能大于上限`;
-      }
-    }
-  }
-  return null;
-}
-
-async function analyze() {
-  clearError();
-  const validationError = validateBeforeSubmit();
-  if (validationError) {
-    showError(validationError);
-    return;
-  }
-
-  const payload = {
-    old_rules: state.old_rules.map(normalizeRule),
-    new_rules: state.new_rules.map(normalizeRule),
-  };
-
+async function pollOnce() {
+  if (!state.deviceCode) return;
   try {
-    const resp = await fetch("/api/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+    const data = await api("/api/device/poll", {
+      client_id: state.clientId,
+      device_code: state.deviceCode,
+    });
+    log(termLog(), "POST /api/device/poll", data);
+    if (data.status === "approved") {
+      $("btnClaim").disabled = false;
+      stopAutoPoll();
+    }
+    if (data.status === "denied" || data.status === "expired") stopAutoPoll();
+    return data.status;
+  } catch (e) {
+    log(termLog(), `轮询失败：${e.message}（${e.code || e.status}）`);
+    stopAutoPoll();
+  }
+}
+
+$("btnAutoPoll").addEventListener("click", () => {
+  if (state.autoTimer) {
+    stopAutoPoll();
+    return;
+  }
+  log(termLog(), "开始自动轮询，每 5 秒一次……");
+  $("btnAutoPoll").textContent = "停止自动轮询";
+  state.autoTimer = setInterval(pollOnce, 5000);
+});
+
+function stopAutoPoll() {
+  if (state.autoTimer) {
+    clearInterval(state.autoTimer);
+    state.autoTimer = null;
+    $("btnAutoPoll").textContent = "自动轮询（每 5 秒）";
+  }
+}
+
+$("btnClaim").addEventListener("click", async () => {
+  try {
+    const data = await api("/api/device/token", {
+      client_id: state.clientId,
+      device_code: state.deviceCode,
+    });
+    state.accessToken = data.access_token;
+    $("btnClaim").disabled = true;
+    $("btnCallIdentity").disabled = false;
+    log(termLog(), "POST /api/device/token → 领取令牌成功（明文仅本次返回，服务端只存哈希）", {
+      ...data,
+      access_token: data.access_token.slice(0, 10) + "…（仅演示截断显示）",
+    });
+    refreshRecords();
+  } catch (e) {
+    log(termLog(), `领取令牌失败：${e.message}（${e.code || e.status}）`);
+  }
+});
+
+$("btnCallIdentity").addEventListener("click", async () => {
+  try {
+    const resp = await fetch("/api/identity", {
+      headers: { Authorization: `Bearer ${state.accessToken}` },
     });
     const data = await resp.json();
-    if (!resp.ok) {
-      showError(formatApiError(data));
-      return;
-    }
-    renderResults(data);
-  } catch (err) {
-    showError(`请求失败：${err.message}`);
+    if (!resp.ok) throw new Error(data.message || `HTTP ${resp.status}`);
+    log(termLog(), "GET /api/identity（Bearer 令牌）→ 身份信息", data);
+  } catch (e) {
+    log(termLog(), `身份接口调用失败：${e.message}`);
   }
-}
-
-function normalizeRule(r) {
-  return {
-    src_cidr: r.src_cidr,
-    dst_cidr: r.dst_cidr,
-    port_low: Number(r.port_low),
-    port_high: Number(r.port_high),
-    action: r.action,
-  };
-}
-
-function formatApiError(data) {
-  if (typeof data.detail === "string") return data.detail;
-  if (Array.isArray(data.detail)) {
-    return data.detail
-      .map((e) => {
-        const loc = (e.loc || []).filter((p) => p !== "body").join(" → ");
-        return `${loc}: ${e.msg}`;
-      })
-      .join("\n");
-  }
-  return "未知错误";
-}
-
-async function loadExample() {
-  clearError();
-  const resp = await fetch("/api/example");
-  const data = await resp.json();
-  state.old_rules = data.old_rules.map(clone);
-  state.new_rules = data.new_rules.map(clone);
-  renderAll();
-}
-
-function clone(obj) {
-  return JSON.parse(JSON.stringify(obj));
-}
-
-function clearAll() {
-  state.old_rules = [];
-  state.new_rules = [];
-  document.getElementById("results").hidden = true;
-  clearError();
-  renderAll();
-}
-
-// --------------------------------------------------------------------------- //
-// 初始化
-// --------------------------------------------------------------------------- //
-document.addEventListener("DOMContentLoaded", () => {
-  document.querySelectorAll("[data-add]").forEach((btn) => {
-    btn.addEventListener("click", () => addRule(btn.dataset.add));
-  });
-  document.getElementById("btn-example").addEventListener("click", loadExample);
-  document.getElementById("btn-clear").addEventListener("click", clearAll);
-  document.getElementById("btn-analyze").addEventListener("click", analyze);
-  loadExample();
 });
+
+// ---------------------------------------------------------------------------
+// 审批侧
+// ---------------------------------------------------------------------------
+
+$("btnFind").addEventListener("click", async () => {
+  const code = $("inputUserCode").value.trim().toUpperCase();
+  if (!code) return;
+  try {
+    const data = await api("/api/admin/find", { user_code: code });
+    state.currentApproval = data;
+    renderApproval(data);
+    log(adminLog(), `查询短码 ${code}`, data);
+  } catch (e) {
+    $("approvalBox").hidden = true;
+    log(adminLog(), `查询失败：${e.message}`);
+  }
+});
+
+function renderApproval(item) {
+  $("approvalBox").hidden = false;
+  const detail = $("approvalDetail");
+  detail.innerHTML = "";
+  const rows = [
+    ["授权编号", item.id],
+    ["客户端 ID", item.client_id],
+    ["设备名", item.device_name],
+    ["当前状态", item.status],
+    ["创建时间", fmtTime(item.created_at)],
+    ["有效期至", fmtTime(item.expires_at)],
+    ["批准者", item.decided_by || "—"],
+  ];
+  for (const [k, v] of rows) {
+    const dt = document.createElement("dt");
+    dt.textContent = k;
+    const dd = document.createElement("dd");
+    dd.textContent = v;
+    detail.append(dt, dd);
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const operable = item.status === "pending" && now < item.expires_at;
+  $("btnApprove").disabled = !operable;
+  $("btnDeny").disabled = !operable;
+}
+
+async function decide(decision) {
+  const code = $("inputUserCode").value.trim().toUpperCase();
+  if (!code || !state.approver) return;
+  try {
+    const data = await api("/api/admin/decide", {
+      user_code: code,
+      approver: state.approver,
+      decision,
+    });
+    log(adminLog(), `${state.approver} 对授权 #${data.id} 执行「${decision === "approve" ? "批准" : "拒绝"}」`, data);
+    renderApproval(data);
+    refreshRecords();
+  } catch (e) {
+    log(adminLog(), `操作失败：${e.message}（${e.code || e.status}）`);
+    $("btnFind").click();
+  }
+}
+
+$("btnApprove").addEventListener("click", () => decide("approve"));
+$("btnDeny").addEventListener("click", () => decide("deny"));
+
+$("btnRefresh").addEventListener("click", refreshRecords);
+
+async function refreshRecords() {
+  try {
+    const data = await api("/api/admin/authorizations");
+    const tbody = $("recordsBody");
+    tbody.innerHTML = "";
+    for (const it of data.items) {
+      const tr = document.createElement("tr");
+      const cells = [
+        it.id,
+        it.client_id,
+        it.device_name,
+        it.user_code_masked,
+        it.status,
+        it.decided_by || "—",
+        fmtTime(it.expires_at),
+      ];
+      for (let i = 0; i < cells.length; i++) {
+        const td = document.createElement("td");
+        td.textContent = cells[i];
+        if (i === 4) td.className = `status-${it.status}`;
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    }
+  } catch (e) {
+    log(adminLog(), `刷新列表失败：${e.message}`);
+  }
+}
+
+// 初始化
+(async function init() {
+  try {
+    await loadIdentities();
+    log(adminLog(), "页面就绪，可切换演示身份并处理待确认授权");
+    log(termLog(), "终端就绪：填写客户端 ID 与设备名后发起授权");
+    refreshRecords();
+    setInterval(refreshRecords, 10000);
+    // 若已打开某个授权，每分钟刷新其可操作状态（过期自动禁用按钮）
+    setInterval(() => {
+      if (state.currentApproval && !$("approvalBox").hidden) $("btnFind").click();
+    }, 30000);
+  } catch (e) {
+    alert("初始化失败：" + e.message);
+  }
+})();

@@ -3,92 +3,99 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>防火墙规则变更核对工具</title>
+  <title>内网设备授权登录系统</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <header class="page-header">
-    <h1>防火墙规则变更核对工具</h1>
-    <p class="subtitle">
-      录入变更单中的旧、新两份有序规则（首条命中生效，未命中默认拒绝），
-      工具按区间计算全部连接中的<strong>新增放行</strong>与<strong>新增阻断</strong>区域，
-      以互不重叠的源地址段 × 目标地址段 × 端口段完整展示，并附示例连接与两侧命中规则。
-    </p>
+  <header class="topbar">
+    <h1>内网设备授权登录系统</h1>
+    <div class="identity-switch">
+      <label for="identitySelect">当前演示身份（人工审批者）：</label>
+      <select id="identitySelect"></select>
+    </div>
   </header>
 
-  <main>
-    <section class="toolbar">
-      <button id="btn-example" type="button" class="btn btn-secondary">载入可编辑示例</button>
-      <button id="btn-clear" type="button" class="btn btn-secondary">清空</button>
-      <button id="btn-analyze" type="button" class="btn btn-primary">开始核对</button>
-      <span class="hint">每份规则表最多 20 条，规则从上到下依次匹配，首条命中生效。</span>
-    </section>
+  <main class="grid">
+    <!-- 左：无浏览器终端模拟 -->
+    <section class="card">
+      <h2>巡检终端（无浏览器）</h2>
 
-    <div id="error-banner" class="error-banner" hidden></div>
+      <div class="block">
+        <h3>1. 发起设备授权</h3>
+        <label>客户端 ID
+          <input id="clientId" value="inspection-terminal-07" />
+        </label>
+        <label>设备名
+          <input id="deviceName" value="机房A区-巡检终端" />
+        </label>
+        <button id="btnAuthorize" class="primary">发起授权请求</button>
+      </div>
 
-    <section class="rule-panels">
-      <div class="panel">
-        <div class="panel-head">
-          <h2>旧规则（变更前）</h2>
-          <button type="button" class="btn btn-small" data-add="old_rules">+ 添加规则</button>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th class="col-order">#</th>
-                <th>源 IPv4 CIDR</th>
-                <th>目标 IPv4 CIDR</th>
-                <th class="col-port">端口下限</th>
-                <th class="col-port">端口上限</th>
-                <th class="col-action">动作</th>
-                <th class="col-ops">操作</th>
-              </tr>
-            </thead>
-            <tbody id="tbody-old_rules"></tbody>
-          </table>
+      <div class="block" id="authResult" hidden>
+        <h3>授权参数（终端保存）</h3>
+        <dl class="kv">
+          <dt>设备码 device_code</dt><dd id="outDeviceCode"></dd>
+          <dt>人工短码 user_code</dt><dd id="outUserCode" class="user-code"></dd>
+          <dt>有效期至</dt><dd id="outExpiresAt"></dd>
+        </dl>
+        <div class="btn-row">
+          <button id="btnPoll">轮询授权状态</button>
+          <button id="btnAutoPoll">自动轮询（每 5 秒）</button>
+          <button id="btnClaim" disabled>领取访问令牌</button>
+          <button id="btnCallIdentity" disabled>调用身份接口</button>
         </div>
       </div>
 
-      <div class="panel">
-        <div class="panel-head">
-          <h2>新规则（变更后）</h2>
-          <button type="button" class="btn btn-small" data-add="new_rules">+ 添加规则</button>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th class="col-order">#</th>
-                <th>源 IPv4 CIDR</th>
-                <th>目标 IPv4 CIDR</th>
-                <th class="col-port">端口下限</th>
-                <th class="col-port">端口上限</th>
-                <th class="col-action">动作</th>
-                <th class="col-ops">操作</th>
-              </tr>
-            </thead>
-            <tbody id="tbody-new_rules"></tbody>
-          </table>
-        </div>
+      <div class="block">
+        <h3>终端输出</h3>
+        <pre id="terminalLog" class="log"></pre>
       </div>
     </section>
 
-    <section id="results" hidden>
-      <div class="results-summary" id="results-summary"></div>
-      <div class="result-column">
-        <h2 class="result-title allow-title">新增放行区域（旧：拒绝 → 新：允许）</h2>
-        <div id="allowed-regions"></div>
+    <!-- 右：人工审批控制台 -->
+    <section class="card">
+      <h2>人工审批控制台</h2>
+
+      <div class="block">
+        <h3>按人工短码核对设备</h3>
+        <label>人工短码
+          <input id="inputUserCode" placeholder="例如：AB3K9M" maxlength="12" />
+        </label>
+        <button id="btnFind">查询待确认设备</button>
       </div>
-      <div class="result-column">
-        <h2 class="result-title block-title">新增阻断区域（旧：允许 → 新：拒绝）</h2>
-        <div id="blocked-regions"></div>
+
+      <div class="block" id="approvalBox" hidden>
+        <h3>设备核对</h3>
+        <dl class="kv" id="approvalDetail"></dl>
+        <div class="btn-row">
+          <button id="btnApprove" class="approve">批准</button>
+          <button id="btnDeny" class="deny">拒绝</button>
+        </div>
+        <p class="hint">仅「待确认」状态可操作；有效期届满后按钮自动失效。</p>
+      </div>
+
+      <div class="block">
+        <h3>全部授权记录（短码脱敏）</h3>
+        <button id="btnRefresh">刷新列表</button>
+        <table class="records">
+          <thead>
+            <tr>
+              <th>#</th><th>客户端 ID</th><th>设备名</th><th>短码</th><th>状态</th><th>批准者</th><th>有效期至</th>
+            </tr>
+          </thead>
+          <tbody id="recordsBody"></tbody>
+        </table>
+      </div>
+
+      <div class="block">
+        <h3>审批操作日志</h3>
+        <pre id="adminLog" class="log"></pre>
       </div>
     </section>
   </main>
 
   <footer>
-    <p>区间化计算：先按所有规则边界切分三维基本区间，再逐区间做首条命中求值与差异合并，不枚举任何 IP。</p>
+    <span>设备码 / 令牌仅以 HMAC-SHA256 哈希存储 · SQLite WAL 多进程共享 · 有效期 5 分钟</span>
   </footer>
 
   <script src="/static/app.js"></script>

@@ -1,14 +1,55 @@
 services:
-  firewall-checker:
+  app1:
     build: .
-    image: firewall-rule-checker:1.0.0
-    container_name: firewall-rule-checker
-    ports:
-      - "8000:8000"
+    image: device-auth-server:1.0.0
+    environment:
+      DEVICE_AUTH_DB: /srv/data/device_auth.db
+      # 生产部署请通过 .env / secrets 覆盖为固定随机值
+      SERVER_PEPPER: ${SERVER_PEPPER:-please-change-this-pepper}
+      AUTH_TTL_SECONDS: "300"
+      AUTH_POLL_INTERVAL: "5"
+    volumes:
+      - auth-data:/srv/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]
-      interval: 30s
+      interval: 15s
       timeout: 5s
-      retries: 3
-      start_period: 10s
+      retries: 5
+      start_period: 8s
+
+  app2:
+    image: device-auth-server:1.0.0
+    depends_on:
+      app1:
+        condition: service_started
+    environment:
+      DEVICE_AUTH_DB: /srv/data/device_auth.db
+      SERVER_PEPPER: ${SERVER_PEPPER:-please-change-this-pepper}
+      AUTH_TTL_SECONDS: "300"
+      AUTH_POLL_INTERVAL: "5"
+    volumes:
+      - auth-data:/srv/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 8s
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      app1:
+        condition: service_healthy
+      app2:
+        condition: service_healthy
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
+
+volumes:
+  auth-data:
